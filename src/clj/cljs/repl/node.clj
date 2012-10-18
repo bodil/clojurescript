@@ -3,7 +3,9 @@
   (:require [clojure.string :as string]
             [clojure.java.io :as io]
             [cljs.compiler :as comp]
-            [cljs.repl :as repl])
+            [cljs.analyzer :as ana]
+            [cljs.repl :as repl]
+            [cljs.repl.server :as server])
   (:import cljs.repl.IJavaScriptEnv
            java.io.PipedReader
            java.io.PipedWriter))
@@ -67,9 +69,13 @@
       result)))
 
 (defn node-setup [repl-env]
-  (repl/load-file repl-env "cljs/core.cljs")
-  (let [env {:context :statement :locals {} :ns (@comp/namespaces comp/*cljs-ns*)}]
-    (repl/evaluate-form repl-env env "<cljs repl>" '(ns cljs.user (:require [cljs.nodejs :as node])))))
+  (let [env (ana/empty-env)]
+    (repl/load-file repl-env "cljs/core.cljs")
+    (swap! loaded-libs conj "cljs.core")
+    (repl/evaluate-form repl-env env "<cljs repl>"
+                        '(ns cljs.user))
+    (repl/evaluate-form repl-env env "<cljs repl>"
+                        '(set! cljs.core/*print-fn* (.-print (js/require "util"))))))
 
 (defn node-eval [repl-env filename line js]
   (let [result (js-eval repl-env filename line js)]
@@ -77,19 +83,10 @@
       {:status :exception :value (:stack error)}
       {:status :success :value (:result result)})))
 
-(defn- object-query-str
-  "Given a list of goog namespaces, create a JavaScript string which,
-  when evaluated, will return true if all of the namespaces exist and
-  false if any do not exist."
-  [ns]
-  (str "(" (apply str (interpose " && " (map #(str "goog.getObjectByName('" (name %) "')") ns))) ")?true:false;"))
-
 (defn load-javascript [repl-env ns url]
   (let [missing (remove #(contains? @loaded-libs %) ns)]
     (when (seq missing)
-      (let [res (js-eval repl-env "<cljs repl>" 1 (object-query-str ns))]
-        (when-not (:result res)
-          (js-eval repl-env (.getPath url) 1 (slurp url))))
+      (js-eval repl-env (.toString url) 1 (slurp url))
       (swap! loaded-libs (partial apply conj) missing))))
 
 (defn node-tear-down [repl-env]
@@ -105,8 +102,8 @@
     (assert resource (str "Can't find " filename " in classpath"))
     (js-eval env filename 1 (slurp resource))))
 
-(extend-protocol repl/IJavaScriptEnv
-  clojure.lang.IPersistentMap
+(defrecord NodeEnv []
+  repl/IJavaScriptEnv
   (-setup [this]
     (node-setup this))
   (-evaluate [this filename line js]
@@ -118,7 +115,15 @@
 
 (defn repl-env
   "Create a Node.js REPL environment."
-  []
-  (doto (launch-node-process)
-    (load-resource "goog/base.js")
-    (load-resource "goog/deps.js")))
+  [& {:as opts}]
+  (let [base (io/resource "goog/base.js")
+        deps (io/resource "goog/deps.js")
+        process (launch-node-process)
+        new-repl-env (merge (NodeEnv.)
+                            (merge process
+                                   {:optimizations :simple}))]
+    (assert base "Can't find goog/base.js in classpath")
+    (assert deps "Can't find goog/deps.js in classpath")
+    (load-resource new-repl-env "goog/base.js")
+    (load-resource new-repl-env "goog/deps.js")
+    new-repl-env))
